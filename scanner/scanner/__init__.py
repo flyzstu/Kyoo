@@ -10,9 +10,7 @@ from scanner.client import KyooClient
 from scanner.fsscan import FsScanner
 from scanner.log import configure_logging
 from scanner.otel import instrument, setup_otelproviders
-from scanner.providers.composite import CompositeProvider
-from scanner.providers.themoviedatabase import TheMovieDatabase
-from scanner.providers.thetvdb import TVDB
+from scanner.providers.wiring import build_provider
 from scanner.refresh import ShowRefresh
 from scanner.requests import RequestCreator, RequestProcessor
 
@@ -31,10 +29,9 @@ async def lifespan(app: FastAPI):
 		get_db() as db,
 		get_db() as leader_db,
 		KyooClient() as client,
-		TVDB() as tvdb,
-		TheMovieDatabase() as tmdb,
+		build_provider() as provider,
 	):
-		app.state.provider = CompositeProvider(tvdb, tmdb)
+		app.state.provider = provider
 		# there's no way someone else used the same id, right?
 		is_master = await leader_db.fetchval(
 			f"select pg_try_advisory_lock({MASTER_LOCK_ID})"

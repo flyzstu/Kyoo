@@ -7,11 +7,88 @@ from typing import Any, cast, override
 
 from guessit.rules.properties.title import TitleFromPosition
 from rebulk import POST_PROCESS, AppendMatch, RemoveMatch, RenameMatch, Rule
+
+from scanner.identifiers.jav import FC2_CODE_RE, JAV_CODE_RE, LEADING_JUNK_RE
 from rebulk.match import Match, Matches
 
 logger = getLogger(__name__)
 
 
+class JavCode(Rule):
+	"""Understand a JAV product code at the start of the filename as the title
+	of a movie.
+
+	Example: '[Group] ABP-123 1080p.mkv'
+	Default:
+	```json
+	{
+		"title": "ABP",
+		"episode": 123,
+		"type": "episode",
+	}
+	```
+	Expected:
+	```json
+	{
+		"title": "ABP-123",
+		"type": "movie",
+	}
+	```
+	"""
+
+	# run before NumberTitle so the code is not split into title/episode
+	priority = POST_PROCESS + 2
+	consequence = [RemoveMatch, AppendMatch]
+
+	@override
+	def when(self, matches: Matches, context) -> Any:
+		fileparts: list[Match] = matches.markers.named("path")
+		if not fileparts:
+			return
+		filename = fileparts[-1]
+		text = (matches.input_string or "")[filename.start : filename.end]
+
+		# only handle codes at the start of the filename (after release groups,
+		# source-site prefixes like `489155.com@` and such) to avoid mangling
+		# regular movies.
+		rest = text[LEADING_JUNK_RE.match(text).end() :]
+		code = None
+		m = FC2_CODE_RE.match(rest)
+		if m:
+			code = f"FC2-{int(m.group(1)):0>7}"
+		else:
+			m = JAV_CODE_RE.match(rest)
+			if m:
+				code = f"{m.group(1).upper()}-{int(m.group(2)):03d}"
+		if m is None:
+			return
+
+		to_remove = matches.range(
+			filename.start,
+			filename.end,
+			lambda x: not x.private and x.name in ("title", "episode", "season"),
+		)
+		base = matches.range(
+			filename.start,
+			filename.end,
+			lambda x: not x.private,
+			0,
+		)
+		title = copy(base)
+		title.name = "title"
+		title.value = code
+		title.tags = ["title"]
+		offset = filename.start + (len(text) - len(rest))
+		title.start = offset + m.start()
+		title.end = offset + m.end()
+
+		# `type` is recomputed by guessit once episode/season matches are gone,
+		# no need to append one (appending would duplicate it).
+
+		return [
+			to_remove + matches.named("type"),
+			[title],
+		]
 class NumberTitle(Rule):
 	"""Understand a number at the start of the filename as the title when an episode follows it
 
