@@ -1,0 +1,438 @@
+# Kyoo deployment for Kubernetes (single-node, nginx-ingress).
+#
+# Prereqs:
+#   1. Edit the `kyoo-secrets` Secret below (JWT_SECRET / PGPASSWORD).
+#   2. Edit PUBLIC_URL in the `kyoo-config` ConfigMap to your external URL.
+#   3. The media PVC must point at your library (replace with hostPath/NFS
+#      as appropriate).
+#
+# Apply with:  kubectl apply -f kyoo.yaml
+#
+# Images are the JAV-enabled fork builds from ghcr.io/flyzstu (tag 5.0.1).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kyoo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kyoo-secrets
+  namespace: kyoo
+type: Opaque
+stringData:
+  # CHANGE ME: random string, e.g. `openssl rand -base64 48`
+  JWT_SECRET: "change-me-jwt-secret"
+  # CHANGE ME: postgres password
+  PGPASSWORD: "change-me-pg-password"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kyoo-config
+  namespace: kyoo
+data:
+  # External URL users reach Kyoo at (no trailing slash)
+  PUBLIC_URL: "https://kyoo.example.com"
+  # JAV scraping sources (tmdb,tvdb also available)
+  KYOO_PROVIDERS: "123av,jav321"
+  AV123_LANGS: "cn,ja"
+---
+# --- Storage -----------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media
+  namespace: kyoo
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: images
+  namespace: kyoo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: transcoder-cache
+  namespace: kyoo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: transcoder-metadata
+  namespace: kyoo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: kyoo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+# --- Postgres -----------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: kyoo
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18
+          env:
+            - name: POSTGRES_USER
+              value: kyoo
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: kyoo-secrets, key: PGPASSWORD } }
+            - name: POSTGRES_DB
+              value: kyoo
+          ports: [{ containerPort: 5432 }]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "kyoo", "-d", "kyoo"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: postgres-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: kyoo
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+# --- Auth ---------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+  namespace: kyoo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: auth }
+  template:
+    metadata:
+      labels: { app: auth }
+    spec:
+      containers:
+        - name: auth
+          image: ghcr.io/flyzstu/kyoo_auth:5.0.1
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: kyoo
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: kyoo-secrets, key: PGPASSWORD } }
+            - name: PGDATABASE
+              value: kyoo
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: kyoo-secrets, key: JWT_SECRET } }
+            - name: JWT_ISSUER
+              valueFrom: { configMapKeyRef: { name: kyoo-config, key: PUBLIC_URL } }
+            # lets the scanner auto-claim an apikey at startup
+            - name: KEIBI_APIKEY_SCANNER
+              value: lazy
+          ports: [{ containerPort: 4568 }]
+          volumeMounts:
+            - { name: profile-pictures, mountPath: /profile_pictures }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: profile-pictures
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+  namespace: kyoo
+spec:
+  selector: { app: auth }
+  ports: [{ port: 4568, targetPort: 4568 }]
+---
+# --- API ----------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: kyoo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/flyzstu/kyoo_api:5.0.1
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: kyoo
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: kyoo-secrets, key: PGPASSWORD } }
+            - name: PGDATABASE
+              value: kyoo
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: kyoo-secrets, key: JWT_SECRET } }
+            - name: JWT_ISSUER
+              valueFrom: { configMapKeyRef: { name: kyoo-config, key: PUBLIC_URL } }
+            - name: IMAGES_PATH
+              value: /images
+          ports: [{ containerPort: 3567 }]
+          volumeMounts:
+            - { name: images, mountPath: /images }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: images
+          persistentVolumeClaim: { claimName: images }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: kyoo
+spec:
+  selector: { app: api }
+  ports: [{ port: 3567, targetPort: 3567 }]
+---
+# --- Scanner ------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scanner
+  namespace: kyoo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: scanner }
+  template:
+    metadata:
+      labels: { app: scanner }
+    spec:
+      containers:
+        - name: scanner
+          image: ghcr.io/flyzstu/kyoo_scanner:5.0.1
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: kyoo
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: kyoo-secrets, key: PGPASSWORD } }
+            - name: PGDATABASE
+              value: kyoo
+            - name: KYOO_URL
+              value: http://api:3567/api
+            - name: AUTH_SERVER
+              value: http://auth:4568
+            - name: JWKS_URL
+              value: http://auth:4568/.well-known/jwks.json
+            - name: JWT_ISSUER
+              valueFrom: { configMapKeyRef: { name: kyoo-config, key: PUBLIC_URL } }
+            - name: SCANNER_LIBRARY_ROOT
+              value: /video
+            - name: KYOO_PROVIDERS
+              valueFrom: { configMapKeyRef: { name: kyoo-config, key: KYOO_PROVIDERS } }
+            - name: AV123_LANGS
+              valueFrom: { configMapKeyRef: { name: kyoo-config, key: AV123_LANGS } }
+          ports: [{ containerPort: 4389 }]
+          volumeMounts:
+            - { name: media, mountPath: /video, readOnly: true }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: media
+          persistentVolumeClaim: { claimName: media }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scanner
+  namespace: kyoo
+spec:
+  selector: { app: scanner }
+  ports: [{ port: 4389, targetPort: 4389 }]
+---
+# --- Transcoder ---------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcoder
+  namespace: kyoo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: transcoder }
+  template:
+    metadata:
+      labels: { app: transcoder }
+    spec:
+      containers:
+        - name: transcoder
+          image: ghcr.io/flyzstu/kyoo_transcoder:5.0.1
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: kyoo
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: kyoo-secrets, key: PGPASSWORD } }
+            - name: PGDATABASE
+              value: kyoo
+            - name: JWKS_URL
+              value: http://auth:4568/.well-known/jwks.json
+            - name: JWT_ISSUER
+              valueFrom: { configMapKeyRef: { name: kyoo-config, key: PUBLIC_URL } }
+            - name: GOCODER_SAFE_PATH
+              value: /video
+          ports: [{ containerPort: 7666 }]
+          volumeMounts:
+            - { name: media, mountPath: /video, readOnly: true }
+            - { name: cache, mountPath: /cache }
+            - { name: metadata, mountPath: /metadata }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { memory: 4Gi }
+      volumes:
+        - name: media
+          persistentVolumeClaim: { claimName: media }
+        - name: cache
+          persistentVolumeClaim: { claimName: transcoder-cache }
+        - name: metadata
+          persistentVolumeClaim: { claimName: transcoder-metadata }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: transcoder
+  namespace: kyoo
+spec:
+  selector: { app: transcoder }
+  ports: [{ port: 7666, targetPort: 7666 }]
+---
+# --- Front --------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: front
+  namespace: kyoo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: front }
+  template:
+    metadata:
+      labels: { app: front }
+    spec:
+      containers:
+        - name: front
+          image: ghcr.io/flyzstu/kyoo_front:5.0.1
+          env:
+            - name: KYOO_URL
+              valueFrom: { configMapKeyRef: { name: kyoo-config, key: PUBLIC_URL } }
+          ports: [{ containerPort: 8901 }]
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: front
+  namespace: kyoo
+spec:
+  selector: { app: front }
+  ports: [{ port: 8901, targetPort: 8901 }]
+---
+# --- Ingress --------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kyoo
+  namespace: kyoo
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend: { service: { name: api, port: { number: 3567 } } }
+          - path: /swagger
+            pathType: Prefix
+            backend: { service: { name: api, port: { number: 3567 } } }
+          - path: /auth
+            pathType: Prefix
+            backend: { service: { name: auth, port: { number: 4568 } } }
+          - path: /.well-known
+            pathType: Prefix
+            backend: { service: { name: auth, port: { number: 4568 } } }
+          - path: /video
+            pathType: Prefix
+            backend: { service: { name: transcoder, port: { number: 7666 } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: front, port: { number: 8901 } } }
